@@ -66,6 +66,21 @@ def ONNXImport(file_path):
         initializer_shapes[init.name] = shape
         
     # 遍历图中的每个节点
+
+    # [Fix] 将 Initializer (权重/偏置) 转换为 Constant 算子
+    # 这是 Conv/Gemm 等算子获取权重的关键
+    for init in onnx_model.graph.initializer:
+        try:
+            # 提取数值
+            val = numpy_helper.to_array(init)
+            # 确定类型
+            dtype = onnx_dtype_mapping.get(init.data_type, "float32")
+            # 创建 Constant 算子 (输入为空，输出为权重名)
+            # 注意：必须确保 nn.Operators.Constant 已被导入且可用
+            const_op = nn.Operators.Constant([], [init.name], value=val, dtype=dtype, version="17")
+            onnx_graph_list.append(const_op)
+        except Exception as e:
+            print(f"⚠️ Warning: Failed to convert initializer {init.name}: {e}")
     for node in onnx_model.graph.node:
         if node.op_type.upper() == "RELU":
             # 处理ReLU操作节点

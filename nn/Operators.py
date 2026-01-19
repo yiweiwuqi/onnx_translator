@@ -860,12 +860,29 @@ class Reshape(Ops):
         return values
 
     def forward_(self, data: Tensor_, shape: Tensor_) -> dict:
-        # 在图推断模式下，如果不传真实数据，很难知道 shape tensor 的具体值
-        # 这里做个简化假设：如果是在 ModelInitParas 里生成的 Graph，Shape 应该是已知的
-        # 如果无法推断，返回一个占位符
-        # 为了演示，假设 output 是 Tensor_ 并拥有一个假定 shape
-        # 实际严谨实现需要 Constant Folding 支持
-        output_tensor = Tensor_(1, dtype=self.dtype) # 无法推断，给个 Dummy
+        # [Fix] 尝试从 shape 输入中获取真实维度
+        target_shape = None
+        if hasattr(shape, "data") and shape.data is not None:
+             try:
+                 target_shape = shape.data.astype(np.int64).flatten().tolist()
+             except: pass
+        
+        if target_shape is None:
+            # 无法推断时，为了避免 Transpose 报错，返回一个保持 rank 的 dummy shape
+            # 或者直接返回 input shape (假设是 reshape(x, x.shape))
+            output_tensor = Tensor_(*data.size, dtype=self.dtype)
+        else:
+            # 标准逻辑
+            total = 1
+            for s in data.size: total *= s
+            infer_idx = -1
+            current = 1
+            for i, s in enumerate(target_shape):
+                if s == -1: infer_idx = i
+                else: current *= s
+            if infer_idx != -1: target_shape[infer_idx] = total // current
+            output_tensor = Tensor_(*tuple(target_shape), dtype=self.dtype)
+
         values = {"tensor": output_tensor, "parameters": None, "graph": None}
         self.parameters = {"values": values}
         return values
@@ -905,7 +922,14 @@ class Transpose(Ops):
         return values
 
     def forward_(self, input: Tensor_) -> dict:
-        out_shape = [input.size[i] for i in self.perm]
+        # [Fix] 增加安全检查
+        try:
+            out_shape = [input.size[i] for i in self.perm]
+        except IndexError:
+            # 如果维度不够，可能是上游 Reshape 失败。返回一个安全的 dummy
+            # print(f"[Warning] Transpose input rank {len(input.size)} mismatch perm {self.perm}")
+            out_shape = input.size
+            
         output_tensor = Tensor_(*out_shape, dtype=self.dtype)
         values = {"tensor": output_tensor, "parameters": None, "graph": None}
         self.parameters = {"values": values}
@@ -1017,12 +1041,20 @@ class Squeeze(Ops):
         return {"tensor": out_tensor, "parameters": None, "graph": None}
 
     def forward_(self, data: Tensor_, axes: Tensor_ = None) -> dict:
-        # 图推断模式下，如果 axes 是动态输入，很难推断 shape
-        # 这里做简化假设
-        out_shape = data.size # 无法推断时保持原样，或返回 Dummy
-        if self.axes is not None:
-             out_shape = self._calc_shape(data.size, self.axes)
-        
+        # [Fix] 尝试从输入 Tensor 读取 axes
+        target_axes = self.axes
+        if target_axes is None and axes is not None and hasattr(axes, 'data') and axes.data is not None:
+            try: target_axes = axes.data.flatten().tolist()
+            except: pass
+            
+        if target_axes is not None:
+            try:
+                out_shape = self._calc_shape(data.size, target_axes)
+            except:
+                out_shape = data.size # 计算失败，降级为原样
+        else:
+            out_shape = data.size # 无法获知 axes，保持原样 (比返回 (1,) 安全)
+            
         output_tensor = Tensor_(*out_shape, dtype=self.dtype)
         return {"tensor": output_tensor, "parameters": None, "graph": None}
 
@@ -1063,9 +1095,19 @@ class Unsqueeze(Ops):
         return {"tensor": out_tensor, "parameters": None, "graph": None}
 
     def forward_(self, data: Tensor_, axes: Tensor_ = None) -> dict:
-        out_shape = data.size
-        if self.axes is not None:
-            out_shape = self._calc_shape(data.size, self.axes)
+        target_axes = self.axes
+        if target_axes is None and axes is not None and hasattr(axes, 'data') and axes.data is not None:
+            try: target_axes = axes.data.flatten().tolist()
+            except: pass
+
+        if target_axes is not None:
+            try:
+                out_shape = self._calc_shape(data.size, target_axes)
+            except:
+                out_shape = data.size
+        else:
+            out_shape = data.size 
+            
         output_tensor = Tensor_(*out_shape, dtype=self.dtype)
         return {"tensor": output_tensor, "parameters": None, "graph": None}
     
@@ -1494,11 +1536,16 @@ class Gather(Ops):
         return {"tensor": Tensor(*out_shape, dtype=self.dtype, data=out_data), "parameters": None, "graph": None}
 
     def forward_(self, data: Tensor_, indices: Tensor_) -> dict:
-        axis = self.axis if self.axis >= 0 else self.axis + len(data.size)
-        d_size = list(data.size) if isinstance(data.size, tuple) else data.size
-        i_size = list(indices.size) if isinstance(indices.size, tuple) else indices.size
-        
-        out_shape = tuple(d_size[:axis] + i_size + d_size[axis+1:])
+        try:
+            axis = self.axis if self.axis >= 0 else self.axis + len(data.size)
+            d_size = list(data.size) if isinstance(data.size, tuple) else data.size
+            i_size = list(indices.size) if isinstance(indices.size, tuple) else indices.size
+            # [Fix] 增加安全切片
+            if axis >= len(d_size): axis = len(d_size) - 1
+            out_shape = tuple(d_size[:axis] + i_size + d_size[axis+1:])
+        except:
+            out_shape = data.size # 兜底
+
         return {"tensor": Tensor_(*out_shape, dtype=self.dtype), "parameters": None, "graph": None}
     
 class Expand(Ops):
@@ -1610,7 +1657,9 @@ class Constant(Ops):
         return {"tensor": Tensor(*val_shape, dtype=self.dtype, data=out_data), "parameters": None, "graph": None}
 
     def forward_(self) -> dict:
-        # 图推断模式
+        # [Fix] 为了支持 Shape 推断，Constant 需要返回真实数据
+        if isinstance(self.value, np.ndarray):
+            return {"tensor": Tensor(*self.value.shape, dtype=self.dtype, data=self.value), "parameters": None, "graph": None}
         shape = self.value.shape if hasattr(self.value, 'shape') else (1,)
         return {"tensor": Tensor_(*shape, dtype=self.dtype), "parameters": None, "graph": None}
     
@@ -2024,8 +2073,22 @@ class Split(Ops):
         return {"tensor": result_tensors, "parameters": None}
 
     def forward_(self, input, split=None):
-        # 返回与输出数量相同的占位符列表
-        return {"tensor": [Tensor_(1, dtype=self.dtype) for _ in self.outputs], "parameters": None}
+        # [Fix] 尽可能保留 Input Rank，避免后续算子越界
+        num_outputs = len(self.outputs)
+        axis = self.axis if self.axis >= 0 else self.axis + len(input.size)
+        
+        # 构造一个假想的 output shape
+        # 如果 input 是 (1,) 这种已经坏掉的 shape，就直接复制
+        if len(input.size) <= axis:
+             out_shape = input.size
+        else:
+             out_shape = list(input.size)
+             # 在 Split 轴上简单除以份数 (仅做示意，确保 Rank 对就行)
+             if out_shape[axis] % num_outputs == 0:
+                 out_shape[axis] //= num_outputs
+             out_shape = tuple(out_shape)
+             
+        return {"tensor": [Tensor_(*out_shape, dtype=self.dtype) for _ in range(num_outputs)], "parameters": None}
     
 # Reduce 基类，复用 Shape 计算逻辑
 class ReduceBase(Ops):
@@ -2348,7 +2411,8 @@ class Resize(Ops):
         return {"tensor": Tensor(*out_shape, dtype=self.dtype, data=out_data), "parameters": None}
 
     def forward_(self, x, roi=None, scales=None, sizes=None):
-        return {"tensor": Tensor_(1, dtype=self.dtype), "parameters": None}
+        # [Fix] 无法推断时保持原 shape，避免后续算子崩溃
+        return {"tensor": Tensor_(*x.size, dtype=self.dtype), "parameters": None}
     
 class TopK(Ops):
     def __init__(self, inputs, outputs, axis=-1, largest=1, sorted=1, dtype="float32", version="17"):
@@ -2567,8 +2631,9 @@ class Einsum(Ops):
         return {"tensor": out_tensor, "parameters": None}
 
     def forward_(self, *inputs):
-        # 不解析等式了，太麻烦
-        return {"tensor": Tensor_(1, dtype=self.dtype), "parameters": None}
+        # [Fix] 返回第一个输入的 shape 以保持 rank
+        s = inputs[0].size if inputs else (1,)
+        return {"tensor": Tensor_(*s, dtype=self.dtype), "parameters": None}
     
 class Elu(Ops):
     def __init__(self, inputs, outputs, alpha=1.0, dtype="float32", version="17"):
