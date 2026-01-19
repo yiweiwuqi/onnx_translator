@@ -6,14 +6,9 @@ from nn.GraphVisualization import GraphGenerate
 import os
 import shutil
 
-# --- 配置 ---
-# 1. 指定要验证的模型路径 (对应上一步生成的模型)
 onnx_file_path = "./onnx_model/model.onnx"
-# 2. 指定本次验证的任务名称 (将作为结果文件夹名)
-task_name = "full_op_verification"
+task_name = "nps_verification"
 
-# --- 准备工作 ---
-# 清理并创建结果目录
 result_dir = os.path.join("./result", task_name)
 if os.path.exists(result_dir):
     shutil.rmtree(result_dir)
@@ -23,10 +18,8 @@ print(f"📁 创建结果目录: {result_dir}")
 def run_verification():
     print(f"\n🚀 开始验证模型: {onnx_file_path}")
 
-    # --- 步骤 1: 导入 ONNX 模型 (ONNXImport) ---
     print("\n[Step 1] 正在运行 ONNXImport 导入算子...")
     try:
-        # 这步会调用 ONNXImport.py 解析模型中的每个节点，并映射到 nn.Operators 中的类
         ops_list = ONNXImport(onnx_file_path)
     except Exception as e:
         print(f"❌ 导入失败! 在解析 ONNX 节点时发生错误: {e}")
@@ -37,10 +30,8 @@ def run_verification():
         return
     
     print(f"✅ 成功导入 {len(ops_list)} 个算子节点。")
-    # 打印前几个算子看看
     print(f"   预览前 5 个算子: {[op.__class__.__name__ for op in ops_list[:5]]} ...")
 
-    # --- 步骤 2: 解析模型输入参数 (ModelInitParas) ---
     print("\n[Step 2] 解析模型初始输入参数...")
     try:
         initial_inputs, initial_tensors = nn.ModelInitParas.ONNXParasGen(onnx_file_path)
@@ -50,7 +41,6 @@ def run_verification():
         print(f"❌ 解析输入参数时出错: {e}")
         return
 
-    # --- 步骤 3: 实例化并构建计算图 (Graph) ---
     print("\n[Step 3] 构建计算图 (Graph 对象)...")
     try:
         # 实例化 Graph 对象
@@ -60,8 +50,6 @@ def run_verification():
             model_name=task_name
         )
         
-        # 使用 Tensor_ (占位符) 进行一次 forward_ 推断
-        # 这一步至关重要，它会触发所有算子的 forward_ 方法，验证形状推断逻辑是否通畅
         print("   正在执行图结构推断 (forward_)...")
         placeholder_tensors = [nn.Tensor_(*t.size, dtype=t.dtype) for t in initial_tensors]
         graph.forward_(*placeholder_tensors)
@@ -69,16 +57,12 @@ def run_verification():
         
     except Exception as e:
         print(f"❌ 构建图或推断形状时出错: {e}")
-        # 即使出错也尝试继续生成图以便调试
         
-    # --- 步骤 4: 生成可视化流程图 (GraphVisualization) ---
     print("\n[Step 4] 生成可视化流程图...")
     try:
-        # GraphGenerate 会遍历 Graph 对象并生成 PDF/PNG
         GraphGenerate(graph, task_name)
         print(f"✅ 可视化文件生成成功！请查看: {result_dir}/{task_name}.pdf")
         
-        # 统计算子类型覆盖率
         op_types = set([op.__class__.__name__ for op in ops_list])
         print(f"\n🎉 验证结束！共覆盖了 {len(op_types)} 种不同的算子类型:")
         print(f"   {list(op_types)}")
