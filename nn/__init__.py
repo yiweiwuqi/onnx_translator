@@ -26,7 +26,7 @@ DTYPE_MAP = {
     "float64": 5,
     "int4": 6,
     "int8": 7,
-    "uint8": 8,
+    "uint8": 8,# unit为无符号数
     "int16": 9,
     "int32": 10,
     "int64": 11,
@@ -121,7 +121,7 @@ class Tensor:
             
         self.data_size = 1
         for s in self.size:
-            self.data_size *= s
+            self.data_size *= s# 计算总元素个数
         self.dtype = dtype
         
         if data is not None:
@@ -129,7 +129,7 @@ class Tensor:
         else:
             # 安全获取 numpy 类型
             np_dtype = DTYPE_TO_NUMPY.get(dtype, np.float32)
-            self.data = np.zeros(self.size, dtype=np_dtype)
+            self.data = np.zeros(self.size, dtype=np_dtype)# 创建一个全0的矩阵
 
 class Tensor_:
     """张量占位符类，用于图构建阶段"""
@@ -214,7 +214,7 @@ class Ops:
     def _execute_unary(self, input_tensor, c_func_name):
         """通用一元算子执行模板"""
         # 1. 准备连续内存输入
-        in_data = np.ascontiguousarray(input_tensor.data)
+        in_data = np.ascontiguousarray(input_tensor.data)# 确保数据连续
         input_c = self._numpy_to_ctensor(in_data, input_tensor.dtype)
         
         # 2. 准备输出 (优先使用 self.dtype，否则沿用输入类型)
@@ -227,7 +227,7 @@ class Ops:
         
         # 4. 转换结果并释放
         out_data = self._ctensor_to_numpy(output_c, out_dtype)
-        self.lib.free_tensor(input_c)
+        self.lib.free_tensor(input_c)# 调用C函数释放内存
         self.lib.free_tensor(output_c)
         
         return Tensor(*input_tensor.size, dtype=out_dtype, data=out_data)
@@ -268,7 +268,7 @@ class Ops:
         out_data = self._ctensor_to_numpy(output_c, out_dtype)
         self.lib.free_tensor(a_c)
         self.lib.free_tensor(b_c)
-        self.lib.free_tensor(output_c)
+        self.lib.free_tensor(output_c)# 释放内存
 
         return Tensor(*out_shape, dtype=out_dtype, data=out_data)
     
@@ -360,12 +360,14 @@ class Ops:
         """
         # 获取形状
         shape = [c_tensor.contents.shape[i] for i in range(c_tensor.contents.ndim)]
+
         # 从C数据创建NumPy数组
         np_dtype = DTYPE_TO_NUMPY[dtype]
         arr = np.frombuffer(
             (ctypes.c_byte * (c_tensor.contents.size * np.dtype(np_dtype).itemsize)).from_address(c_tensor.contents.data),
             dtype=np_dtype
         ).reshape(shape)
+
         return arr.copy()
 
 class Graph:
