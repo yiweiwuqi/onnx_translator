@@ -215,3 +215,8 @@ onnx_model/
 results/
 bin/
 .VSCodeCounter/
+# verification artifacts
+result/
+onnx_model/
+cache/
+tmp_*.bin

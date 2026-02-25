@@ -56,7 +56,7 @@ class RELU(Ops):
         Returns:
             Tensor: 经过ReLU激活后的输出张量
         """
-        out_tensor = self._execute_unary(input, "relu_forward")
+        out_tensor = self._execute_unary(input, "relu_forward")# 调用通用的一元执行模板
         values = {"tensor": out_tensor, "parameters": None, "graph": None}
         self.parameters = {"values": values}
         return values

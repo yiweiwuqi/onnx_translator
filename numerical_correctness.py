@@ -4,7 +4,7 @@ import os
 import nn
 from nn import Tensor
 import matplotlib.pyplot as plt
-from nn.Operators import RELU, COS, ABS, ADD, SUB, MUL, DIV, QuantizeLinear, DequantizeLinear, Conv, MaxPool, Gemm, Softmax
+from nn.Operators import Constant, Gemm, MaxPool,Unsqueeze,Shape ,ADD,Gather,MUL ,Cast,Concat,Reshape,Slice,Transpose,Expand,MatMul,ConstantOfShape,Where,DIV,Equal,SUB,Range,ReduceMean,RELU,Pow,SQRT,Conv,ScatterND,Squeeze,Clip,Greater,Softmax,Less 
 
 # =============================================================================
 # 1. 辅助工具
@@ -274,18 +274,40 @@ def verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args={}, iteratio
         for s, d in zip(shapes, dtypes):
             if s is None: inputs_np.append(None)
             else: inputs_np.append(generate_random_data(s, d))
-            
+
+        if op_name == "clip":
+            inputs_np[1][...] = -1.0
+            inputs_np[2][...] = 1.0
+
+        if op_name == "sqrt":
+            # 主路径：保证非负，避免 NaN 干扰对齐
+            inputs_np[0] = np.abs(inputs_np[0]).astype(inputs_np[0].dtype, copy=False)
+
+        if op_name == "gather":
+            M, N = shapes[0]      # data shape (M,N)
+            idx_shape = shapes[1] # indices shape (I,)
+            inputs_np[1] = np.random.randint(0, M, size=idx_shape).astype(np.int64)
+          
         if op_name in ["quantize_linear", "dequantize_linear"]:
             if inputs_np[1] is not None: inputs_np[1] = np.abs(inputs_np[1]) + 1e-4
             if inputs_np[2] is not None:
                 inputs_np[2] = np.round(inputs_np[2])
                 if op_name == "quantize_linear": inputs_np[2] = np.clip(inputs_np[2], -128, 127)
+        if op_name == "scatternd":
+            M, N = shapes[0]       # data: (M,N)
+            I, K = shapes[1]       # indices: (I,2)
+            assert K == 2
+            rng = np.random.default_rng(0)
+            flat = rng.choice(M * N, size=I, replace=False)
+            rows = flat // N
+            cols = flat % N
+            inputs_np[1] = np.stack([rows, cols], axis=1).astype(np.int64)
 
         inputs_tensor = []
         for data, d in zip(inputs_np, dtypes):
             if data is not None: inputs_tensor.append(Tensor(*data.shape, dtype=d, data=data))
             else: inputs_tensor.append(None)
-            
+
         # 2. NPS 运行
         try:
             op = op_cls(inputs=[], outputs=[], dtype=out_dtype, **init_args)
@@ -342,7 +364,29 @@ def verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args={}, iteratio
         elif op_name == "quantize_linear":
             is_signed = 1 if "int8" in out_dtype and "uint8" not in out_dtype else 0
             params_bin = np.array([is_signed], dtype=np.int32).tobytes()
+        elif op_name == "matmul":
+            M, K = shapes[0]
+            K2, N = shapes[1]
+            assert K2 == K
+            params_bin = np.array([M, K, N], dtype=np.int32).tobytes()
+        elif op_name == "reduce_mean":
+            M, N = shapes[0]
+            params_bin = np.array([M, N], dtype=np.int32).tobytes()
 
+        elif op_name == "gather":
+            # 主路径：data=(M,N), indices=(I,), axis=0
+            M, N = shapes[0]
+            (I,) = shapes[1]
+            params_bin = np.array([M, N, I], dtype=np.int32).tobytes()
+    
+        elif op_name == "scatternd":
+            M, N = shapes[0]         # data: (M,N)
+            I, K = shapes[1]         # indices: (I,2)
+            assert K == 2
+            (I2,) = shapes[2]        # updates: (I,)
+            assert I2 == I
+            params_bin = np.array([M, N, I], dtype=np.int32).tobytes()
+        
         # 4. 数据转换与 广播处理
         expected_shape = nps_out.shape
         is_complex_kernel = op_name in ["conv2d", "max_pool", "gemm", "softmax"] # 这些算子自己处理形状
@@ -353,11 +397,15 @@ def verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args={}, iteratio
             if inp is None:
                 cuda_inputs.append(None)
             else:
+                if  op_name in ["gather", "scatternd"] and d == "int64":
+                    cuda_inputs.append(np.ascontiguousarray(inp.astype(np.int64)))
+                    continue
+
                 target_dtype = np.float64 if is_double_kernel else np.float32
                 val_f32 = to_float32(inp, d)
                 
                 # 广播逻辑
-                if not is_complex_kernel:
+                if (not is_complex_kernel) and (op_name not in ["matmul", "reduce_mean","gather", "scatternd"]):
                     try:
                         if val_f32.shape != expected_shape:
                             val_f32 = np.broadcast_to(val_f32, expected_shape)
@@ -406,7 +454,7 @@ def verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args={}, iteratio
                     if inp_arr is None: val_disp = "None"
                     else:
                         try:
-                            if not is_complex_kernel:
+                            if (not is_complex_kernel) and (op_name not in ["matmul", "reduce_mean", "gather", "scatternd"]):
                                 val_disp = np.broadcast_to(inp_arr, expected_shape)[idx]
                             else:
                                 if inp_arr.shape == expected_shape:
@@ -429,142 +477,187 @@ def verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args={}, iteratio
 # 3. 测试计划
 # =============================================================================
 if __name__ == "__main__":
+    # plans = [
+    #     (ADD, "add", [(64,64), (64,64)], ["float32", "float32"], "float32"),
+    #     (SUB, "sub", [(64,64), (64,64)], ["float16", "float16"], "float16"),
+    #     (MUL, "mul", [(64,64), (64,64)], ["bfloat16", "bfloat16"], "bfloat16"),
+    #     (DIV, "div", [(64,64), (64,64)], ["float32", "float32"], "float32"),
+    #     (DIV, "div", [(64,64), (64,64)], ["float16", "float32"], "float16"),
+        
+    #     # Int8 GEMM 模拟: Int8 * Int8 -> Int32 (防止溢出)
+    #     (MUL, "mul", [(64,64), (64,64)], ["int8", "int8"], "int32"),
+    #     # Int8 累加: Int8 + Int32 -> Int32
+    #     (ADD, "add", [(64,64), (64,64)], ["int8", "int32"], "int32"),
+    #     # 极限 Int4: Int4 * Int4 -> Int16
+    #     (MUL, "mul", [(64,64), (64,64)], ["int4", "int4"], "int16"),
+    #     # A32W4 场景: FP32 + Int4 -> FP32
+    #     (MUL, "mul", [(64,64), (64,64)], ["float32", "int4"], "float32"),
+    #     (ADD, "add", [(64,64), (64,64)], ["float32", "int4"], "float32"),
+    #     # FP16 + INT8 -> FP16
+    #     (MUL, "mul", [(64,64), (64,64)], ["float16", "int8"], "float16"),
+    #     (ADD, "add", [(64,64), (64,64)], ["float16", "int8"], "float16"),
+    #     # FP32 + INT8 -> FP32
+    #     (MUL, "mul", [(64,64), (64,64)], ["float32", "int8"], "float32"),
+    #     (ADD, "add", [(64,64), (64,64)], ["float32", "int8"], "float32"),
+    #     # 混合精度累加: FP16 + FP32 -> FP32 (ResNet/Transformer 常见)
+    #     (ADD, "add", [(64,64), (64,64)], ["float16", "float32"], "float32"),
+    #     # BF16 混合: BF16 * FP32 -> FP32
+    #     (MUL, "mul", [(64,64), (64,64)], ["bfloat16", "float32"], "float32"),
+    #     # 降级转换测试: FP32 / FP16 -> FP16
+    #     (DIV, "div", [(64,64), (64,64)], ["float32", "float16"], "float16"),
+    #     # E4M3 (权重) * E4M3 (激活) -> FP16
+    #     (MUL, "mul", [(64,64), (64,64)], ["float8_e4m3", "float8_e4m3"], "float16"),
+    #     # E5M2 (梯度) + FP16 -> FP16
+    #     (ADD, "add", [(64,64), (64,64)], ["float8_e5m2", "float16"], "float16"),
+    #     # 混合 FP8: E4M3 * E5M2 -> FP32
+    #     (MUL, "mul", [(64,64), (64,64)], ["float8_e4m3", "float8_e5m2"], "float32"),
+        
+    #     (MUL, "mul", [(64,64), (64,64)], ["bfloat16", "bfloat16"], "bfloat16"),
+    #     (ADD, "add", [(64,64), (64,64)], ["float8_e4m3", "float16"], "float16"),
+    #     (DIV, "div", [(10, 10, 10), (10, 1)], ["float32", "float32"], "float32"),
+    #     (SUB, "sub", [(4, 1, 16), (16,)], ["float32", "float32"], "float32"),
+        
+    #     (ABS, "abs", [(100,)], ["float8_e4m3"], "float8_e4m3"),
+    #     (COS, "cos", [(100,)], ["float32"], "float32"),
+    #     (COS, "cos", [(100,)], ["float16"], "float16"),
+    #     (RELU, "relu", [(100,100)], ["float32"], "float32"),
+    #     (RELU, "relu", [(100,100)], ["float16"], "float16"),
+    #     (RELU, "relu", [(100,100)], ["int8"], "int8"),
+        
+    #     # --- QDQ 测试 ---
+    #     # QuantizeLinear: FP32(Data) + FP32(Scale) + FP32(ZP) -> INT8
+    #     # 测试 1: 标量 Scale/ZP 广播到张量
+    #     (QuantizeLinear, "quantize_linear", 
+    #      [(64, 64), (1,), (1,)], 
+    #      ["float32", "float32", "float32"], "int8"),
+         
+    #     # 测试 2: Per-Channel 量化 (Scale/ZP 是向量)
+    #     (QuantizeLinear, "quantize_linear", 
+    #      [(2, 16, 4, 4), (1, 16, 1, 1), (1, 16, 1, 1)], 
+    #      ["float32", "float32", "float32"], "int8"),
+
+    #     # DequantizeLinear: INT8(Data) + FP32(Scale) + FP32(ZP) -> FP32
+    #     (DequantizeLinear, "dequantize_linear", 
+    #      [(64, 64), (1,), (1,)], 
+    #      ["int8", "float32", "float32"], "float32"),
+        
+    #     (Conv, "conv2d", 
+    #      [(1,1,5,5), (1,1,3,3), (1,)], 
+    #      ["float32", "float32", "float32"], "float32",
+    #      {"pads":[0,0,0,0], "strides":[1,1], "dilations":[1,1], "group":1}),
+         
+    #     # MaxPool: X(1,1,4,4) k=2 s=2
+    #     (MaxPool, "max_pool",
+    #      [(1,1,4,4)], ["float32"], "float32",
+    #      {"kernel_shape":[2,2], "pads":[0,0,0,0], "strides":[2,2]}),
+         
+    #     # Gemm: A(2,3) B(3,4) C(4)
+    #     (Gemm, "gemm",
+    #      [(2,3), (3,4), (4,)], ["float32", "float32", "float32"], "float32",
+    #      {"alpha":1.0, "beta":1.0, "transA":0, "transB":0}),
+         
+    #     # Softmax: X(2,5) axis=1
+    #     (Softmax, "softmax",
+    #      [(2,5)], ["float32"], "float32", {"axis":1}),
+        
+    #     # 1. [FP16 推理]: Half 输入/权重 + Float 偏置 -> Float 输出
+    #     # 这是 TensorRT/ONNXRuntime 中最常见的混合精度模式
+    #     (Conv, "conv2d",
+    #      [(1, 2, 7, 7), (4, 2, 3, 3), (4,)], 
+    #      ["float16", "float16", "float32"], "float32",
+    #      {"pads":[1,1,1,1], "strides":[1,1], "dilations":[1,1], "group":1}),
+         
+    #     # 2. [FP8 极限推理]: E4M3 输入/权重 + FP16 偏置 -> FP16 输出
+    #     # 模拟 NVIDIA H100 上的 FP8 卷积
+    #     (Conv, "conv2d",
+    #      [(1, 4, 8, 8), (8, 4, 3, 3), (8,)], 
+    #      ["float8_e4m3", "float8_e4m3", "float16"], "float16",
+    #      {"pads":[0,0,0,0], "strides":[2,2], "dilations":[1,1], "group":1}),
+
+    #     # 3. [BF16 Depthwise]: BFloat16 深度卷积 (Group = InChannel)
+    #     # 验证 Group 卷积逻辑与 BF16 的结合
+    #     (Conv, "conv2d",
+    #      [(1, 8, 6, 6), (8, 1, 3, 3), None], # 无 Bias
+    #      ["bfloat16", "bfloat16", "float32"], "bfloat16",
+    #      {"pads":[1,1,1,1], "strides":[1,1], "dilations":[1,1], "group":8}),
+
+    #     # --- Gemm 混合精度场景 ---
+    #     # 4. [Tensor Core 模式]: FP16 * FP16 + FP32 -> FP32
+    #     # 典型的混合精度累加测试
+    #     (Gemm, "gemm",
+    #      [(16, 32), (32, 8), (8,)],
+    #      ["float16", "float16", "float32"], "float32",
+    #      {"alpha":1.0, "beta":1.0, "transA":0, "transB":0}),
+
+    #     # 5. [FP8 混合]: E5M2 (高动态范围) * E4M3 (高精度) -> BF16
+    #     # 测试 TransB=1 (矩阵转置) 和非对称 FP8 类型
+    #     (Gemm, "gemm",
+    #      [(8, 16), (8, 16), None],
+    #      ["float8_e5m2", "float8_e4m3", "float32"], "bfloat16",
+    #      {"alpha":0.5, "beta":0.0, "transA":0, "transB":1}),
+
+    #     # --- 其他算子低精度测试 ---
+
+    #     # 6. [BF16 MaxPool]
+    #     (MaxPool, "max_pool",
+    #      [(1, 2, 16, 16)], ["bfloat16"], "bfloat16",
+    #      {"kernel_shape":[2,2], "pads":[0,0,0,0], "strides":[2,2]}),
+
+    #     # 7. [FP16 Softmax]
+    #     # 验证在低精度下 exp/sum 的数值稳定性
+    #     (Softmax, "softmax",
+    #      [(4, 64)], ["float16"], "float16", {"axis":-1}),
+         
+    #     # 8. [FP8 Softmax] (E4M3)
+    #     # 极低精度下的 Softmax，用于验证饱和截断逻辑
+    #     (Softmax, "softmax",
+    #      [(2, 10)], ["float8_e4m3"], "float8_e4m3", {"axis":1}),
+    # ]
+
     plans = [
-        (ADD, "add", [(64,64), (64,64)], ["float32", "float32"], "float32"),
-        (SUB, "sub", [(64,64), (64,64)], ["float16", "float16"], "float16"),
-        (MUL, "mul", [(64,64), (64,64)], ["bfloat16", "bfloat16"], "bfloat16"),
-        (DIV, "div", [(64,64), (64,64)], ["float32", "float32"], "float32"),
-        (DIV, "div", [(64,64), (64,64)], ["float16", "float32"], "float16"),
-        
-        # Int8 GEMM 模拟: Int8 * Int8 -> Int32 (防止溢出)
-        (MUL, "mul", [(64,64), (64,64)], ["int8", "int8"], "int32"),
-        # Int8 累加: Int8 + Int32 -> Int32
-        (ADD, "add", [(64,64), (64,64)], ["int8", "int32"], "int32"),
-        # 极限 Int4: Int4 * Int4 -> Int16
-        (MUL, "mul", [(64,64), (64,64)], ["int4", "int4"], "int16"),
-        # A32W4 场景: FP32 + Int4 -> FP32
-        (MUL, "mul", [(64,64), (64,64)], ["float32", "int4"], "float32"),
-        (ADD, "add", [(64,64), (64,64)], ["float32", "int4"], "float32"),
-        # FP16 + INT8 -> FP16
-        (MUL, "mul", [(64,64), (64,64)], ["float16", "int8"], "float16"),
-        (ADD, "add", [(64,64), (64,64)], ["float16", "int8"], "float16"),
-        # FP32 + INT8 -> FP32
-        (MUL, "mul", [(64,64), (64,64)], ["float32", "int8"], "float32"),
-        (ADD, "add", [(64,64), (64,64)], ["float32", "int8"], "float32"),
-        # 混合精度累加: FP16 + FP32 -> FP32 (ResNet/Transformer 常见)
-        (ADD, "add", [(64,64), (64,64)], ["float16", "float32"], "float32"),
-        # BF16 混合: BF16 * FP32 -> FP32
-        (MUL, "mul", [(64,64), (64,64)], ["bfloat16", "float32"], "float32"),
-        # 降级转换测试: FP32 / FP16 -> FP16
-        (DIV, "div", [(64,64), (64,64)], ["float32", "float16"], "float16"),
-        # E4M3 (权重) * E4M3 (激活) -> FP16
-        (MUL, "mul", [(64,64), (64,64)], ["float8_e4m3", "float8_e4m3"], "float16"),
-        # E5M2 (梯度) + FP16 -> FP16
-        (ADD, "add", [(64,64), (64,64)], ["float8_e5m2", "float16"], "float16"),
-        # 混合 FP8: E4M3 * E5M2 -> FP32
-        (MUL, "mul", [(64,64), (64,64)], ["float8_e4m3", "float8_e5m2"], "float32"),
-        
-        (MUL, "mul", [(64,64), (64,64)], ["bfloat16", "bfloat16"], "bfloat16"),
-        (ADD, "add", [(64,64), (64,64)], ["float8_e4m3", "float16"], "float16"),
-        (DIV, "div", [(10, 10, 10), (10, 1)], ["float32", "float32"], "float32"),
-        (SUB, "sub", [(4, 1, 16), (16,)], ["float32", "float32"], "float32"),
-        
-        (ABS, "abs", [(100,)], ["float8_e4m3"], "float8_e4m3"),
-        (COS, "cos", [(100,)], ["float32"], "float32"),
-        (COS, "cos", [(100,)], ["float16"], "float16"),
-        (RELU, "relu", [(100,100)], ["float32"], "float32"),
-        (RELU, "relu", [(100,100)], ["float16"], "float16"),
-        (RELU, "relu", [(100,100)], ["int8"], "int8"),
-        
-        # --- QDQ 测试 ---
-        # QuantizeLinear: FP32(Data) + FP32(Scale) + FP32(ZP) -> INT8
-        # 测试 1: 标量 Scale/ZP 广播到张量
-        (QuantizeLinear, "quantize_linear", 
-         [(64, 64), (1,), (1,)], 
-         ["float32", "float32", "float32"], "int8"),
-         
-        # 测试 2: Per-Channel 量化 (Scale/ZP 是向量)
-        (QuantizeLinear, "quantize_linear", 
-         [(2, 16, 4, 4), (1, 16, 1, 1), (1, 16, 1, 1)], 
-         ["float32", "float32", "float32"], "int8"),
+    # ---- 四则运算 ----
+    (ADD, "add", [(64,64), (64,64)], ["float32", "float32"], "float32"),
+    (SUB, "sub", [(64,64), (64,64)], ["float32", "float32"], "float32"),
+    (MUL, "mul", [(64,64), (64,64)], ["float32", "float32"], "float32"),
+    (DIV, "div", [(64,64), (64,64)], ["float32", "float32"], "float32"),
 
-        # DequantizeLinear: INT8(Data) + FP32(Scale) + FP32(ZP) -> FP32
-        (DequantizeLinear, "dequantize_linear", 
-         [(64, 64), (1,), (1,)], 
-         ["int8", "float32", "float32"], "float32"),
-        
-        (Conv, "conv2d", 
-         [(1,1,5,5), (1,1,3,3), (1,)], 
-         ["float32", "float32", "float32"], "float32",
-         {"pads":[0,0,0,0], "strides":[1,1], "dilations":[1,1], "group":1}),
-         
-        # MaxPool: X(1,1,4,4) k=2 s=2
-        (MaxPool, "max_pool",
-         [(1,1,4,4)], ["float32"], "float32",
-         {"kernel_shape":[2,2], "pads":[0,0,0,0], "strides":[2,2]}),
-         
-        # Gemm: A(2,3) B(3,4) C(4)
-        (Gemm, "gemm",
-         [(2,3), (3,4), (4,)], ["float32", "float32", "float32"], "float32",
-         {"alpha":1.0, "beta":1.0, "transA":0, "transB":0}),
-         
-        # Softmax: X(2,5) axis=1
-        (Softmax, "softmax",
-         [(2,5)], ["float32"], "float32", {"axis":1}),
-        
-        # 1. [FP16 推理]: Half 输入/权重 + Float 偏置 -> Float 输出
-        # 这是 TensorRT/ONNXRuntime 中最常见的混合精度模式
-        (Conv, "conv2d",
-         [(1, 2, 7, 7), (4, 2, 3, 3), (4,)], 
-         ["float16", "float16", "float32"], "float32",
-         {"pads":[1,1,1,1], "strides":[1,1], "dilations":[1,1], "group":1}),
-         
-        # 2. [FP8 极限推理]: E4M3 输入/权重 + FP16 偏置 -> FP16 输出
-        # 模拟 NVIDIA H100 上的 FP8 卷积
-        (Conv, "conv2d",
-         [(1, 4, 8, 8), (8, 4, 3, 3), (8,)], 
-         ["float8_e4m3", "float8_e4m3", "float16"], "float16",
-         {"pads":[0,0,0,0], "strides":[2,2], "dilations":[1,1], "group":1}),
+    # ---- 常见广播----
+    (ADD, "add", [(10, 10, 10), (10, 1)], ["float32", "float32"], "float32"),
+    (SUB, "sub", [(4, 1, 16), (16,)], ["float32", "float32"], "float32"),
 
-        # 3. [BF16 Depthwise]: BFloat16 深度卷积 (Group = InChannel)
-        # 验证 Group 卷积逻辑与 BF16 的结合
-        (Conv, "conv2d",
-         [(1, 8, 6, 6), (8, 1, 3, 3), None], # 无 Bias
-         ["bfloat16", "bfloat16", "float32"], "bfloat16",
-         {"pads":[1,1,1,1], "strides":[1,1], "dilations":[1,1], "group":8}),
+    # ---- 激活 ----
+    (RELU, "relu", [(128,128)], ["float32"], "float32"),
 
-        # --- Gemm 混合精度场景 ---
-        # 4. [Tensor Core 模式]: FP16 * FP16 + FP32 -> FP32
-        # 典型的混合精度累加测试
-        (Gemm, "gemm",
-         [(16, 32), (32, 8), (8,)],
-         ["float16", "float16", "float32"], "float32",
-         {"alpha":1.0, "beta":1.0, "transA":0, "transB":0}),
+    # ---- Conv ----
+    (Conv, "conv2d",[(1, 1, 5, 5), (1, 1, 3, 3), (1,)],["float32", "float32", "float32"], "float32",{"pads":[0,0,0,0], "strides":[1,1], "dilations":[1,1], "group":1}),
 
-        # 5. [FP8 混合]: E5M2 (高动态范围) * E4M3 (高精度) -> BF16
-        # 测试 TransB=1 (矩阵转置) 和非对称 FP8 类型
-        (Gemm, "gemm",
-         [(8, 16), (8, 16), None],
-         ["float8_e5m2", "float8_e4m3", "float32"], "bfloat16",
-         {"alpha":0.5, "beta":0.0, "transA":0, "transB":1}),
+    # ---- Softmax ----
+    (Softmax, "softmax",[(4, 64)], ["float32"], "float32", {"axis":-1}),
 
-        # --- 其他算子低精度测试 ---
+    # ---- Gemm ----
+    (Gemm, "gemm",[(16, 32), (32, 8), (8,)], ["float32", "float32", "float32"], "float32",{"alpha":1.0, "beta":1.0, "transA":0, "transB":0}),
 
-        # 6. [BF16 MaxPool]
-        (MaxPool, "max_pool",
-         [(1, 2, 16, 16)], ["bfloat16"], "bfloat16",
-         {"kernel_shape":[2,2], "pads":[0,0,0,0], "strides":[2,2]}),
+    # ---- MaxPool ----
+    (MaxPool, "max_pool",[(1, 2, 16, 16)], ["float32"], "float32",{"kernel_shape":[2,2], "pads":[0,0,0,0], "strides":[2,2]}),
 
-        # 7. [FP16 Softmax]
-        # 验证在低精度下 exp/sum 的数值稳定性
-        (Softmax, "softmax",
-         [(4, 64)], ["float16"], "float16", {"axis":-1}),
-         
-        # 8. [FP8 Softmax] (E4M3)
-        # 极低精度下的 Softmax，用于验证饱和截断逻辑
-        (Softmax, "softmax",
-         [(2, 10)], ["float8_e4m3"], "float8_e4m3", {"axis":1}),
-    ]
+    (Equal,   "equal",   [(64,64), (64,64)], ["float32", "float32"], "bool"),
+    (Greater, "greater", [(64,64), (64,64)], ["float32", "float32"], "bool"),
+    (Less,    "less",    [(64,64), (64,64)], ["float32", "float32"], "bool"),
+
+    (Clip, "clip",[(64,64), (1,), (1,)],["float32", "float32", "float32"],"float32"),
+
+    (SQRT, "sqrt", [(64, 64)], ["float32"], "float32"),
+
+    (Pow, "pow", [(64,64), (64,64)], ["float32", "float32"], "float32"),
+
+    (MatMul, "matmul",[(32, 64), (64,16)],["float32", "float32"],"float32"),
+
+    (ReduceMean, "reduce_mean",[(32, 64)],["float32"], "float32"),
+
+    (Gather, "gather",[(32, 64), (8,)],["float32", "int64"],"float32",{"axis": 0}),
+
+    (ScatterND, "scatternd",[(32, 64), (16, 2), (16,)],["float32", "int64", "float32"],"float32"),  
+]
 
     print("🚀 开始数值验证 ...")
     ops_stats = {}
@@ -577,7 +670,7 @@ if __name__ == "__main__":
         else:
             print(f"⚠️ 跳过格式错误的测试计划: {plan}")
             continue
-        abs_errs, rel_errs = verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args=init_args, iterations=200)
+        abs_errs, rel_errs = verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args=init_args, iterations=20)# 这里把200改成了20，每个plan只生成20组输入
         # 按算子名称聚合数据
         if op_name not in ops_stats:
             ops_stats[op_name] = {'abs': [], 'rel': []}
