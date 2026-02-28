@@ -6,7 +6,10 @@ from nn.GraphVisualization import GraphGenerate
 import os
 import shutil
 
-onnx_file_path = "./onnx_model/model.onnx"
+#onnx_file_path = "./onnx_model/model.onnx"
+#onnx_file_path = "./onnx_model/uniad_dummy.onnx"
+#onnx_file_path = "./onnx_model/simplify_extract_img_feat.onnx"
+onnx_file_path = "./onnx_model/simplify_revised_head.onnx"
 task_name = "nps_verification"
 
 result_dir = os.path.join("./result", task_name)
@@ -22,7 +25,10 @@ def run_verification():
     try:
         ops_list = ONNXImport(onnx_file_path)
     except Exception as e:
-        print(f"❌ 导入失败! 在解析 ONNX 节点时发生错误: {e}")
+        print("❌ 导入失败! 完整错误堆栈如下:")
+        print("-" * 60)
+        traceback.print_exc()
+        print("-" * 60)
         return
 
     if not ops_list:

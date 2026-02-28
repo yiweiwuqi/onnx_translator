@@ -859,29 +859,77 @@ class Reshape(Ops):
         self.parameters = {"values": values}
         return values
 
+    # def forward_(self, data: Tensor_, shape: Tensor_) -> dict:
+    #     target_shape = None
+    #     if hasattr(shape, "data") and shape.data is not None:
+    #          try:
+    #              target_shape = shape.data.astype(np.int64).flatten().tolist()
+    #          except: pass
+        
+    #     if target_shape is None:
+    #         # 无法推断时，为了避免 Transpose 报错，返回一个保持 rank 的 dummy shape
+    #         # 或者直接返回 input shape (假设是 reshape(x, x.shape))
+    #         output_tensor = Tensor_(*data.size, dtype=self.dtype)
+    #     else:
+    #         # 标准逻辑
+    #         total = 1
+    #         for s in data.size: total *= s
+    #         infer_idx = -1
+    #         current = 1
+    #         for i, s in enumerate(target_shape):
+    #             if s == -1: infer_idx = i
+    #             else: current *= s
+    #         if infer_idx != -1: target_shape[infer_idx] = total // current
+    #         output_tensor = Tensor_(*tuple(target_shape), dtype=self.dtype)
+
+    #     values = {"tensor": output_tensor, "parameters": None, "graph": None}
+    #     self.parameters = {"values": values}
+    #     return values
     def forward_(self, data: Tensor_, shape: Tensor_) -> dict:
-        # [Fix] 尝试从 shape 输入中获取真实维度
         target_shape = None
+        
+        # 尝试从 shape 参数中获取真实数据
         if hasattr(shape, "data") and shape.data is not None:
              try:
                  target_shape = shape.data.astype(np.int64).flatten().tolist()
              except: pass
         
         if target_shape is None:
-            # 无法推断时，为了避免 Transpose 报错，返回一个保持 rank 的 dummy shape
-            # 或者直接返回 input shape (假设是 reshape(x, x.shape))
+            print(f"⚠️ Warning: Reshape (forward_) cannot infer target shape for Input {data.size}. Returning Input Shape.")
             output_tensor = Tensor_(*data.size, dtype=self.dtype)
         else:
-            # 标准逻辑
+            # 标准逻辑：处理 -1
             total = 1
             for s in data.size: total *= s
+            
             infer_idx = -1
             current = 1
+            final_shape = []
+            
             for i, s in enumerate(target_shape):
-                if s == -1: infer_idx = i
-                else: current *= s
-            if infer_idx != -1: target_shape[infer_idx] = total // current
-            output_tensor = Tensor_(*tuple(target_shape), dtype=self.dtype)
+                if s == -1: 
+                    infer_idx = i
+                    final_shape.append(-1) # 暂时占位
+                elif s == 0:
+                    # ONNX 规定：Reshape 为 0 代表拷贝对应维度的输入大小 (Legacy)
+                    # 但新版 opset 通常直接给数值。这里简单处理：
+                    if i < len(data.size):
+                        final_shape.append(data.size[i])
+                        current *= data.size[i]
+                    else:
+                        final_shape.append(s)
+                        current *= s
+                else:
+                    final_shape.append(s)
+                    current *= s
+            
+            # 填补 -1
+            if infer_idx != -1:
+                if current == 0: dim = 0 # 避免除以0
+                else: dim = total // current
+                final_shape[infer_idx] = dim
+                
+            output_tensor = Tensor_(*tuple(final_shape), dtype=self.dtype)
 
         values = {"tensor": output_tensor, "parameters": None, "graph": None}
         self.parameters = {"values": values}
@@ -921,15 +969,36 @@ class Transpose(Ops):
         self.parameters = {"values": values}
         return values
 
+    # def forward_(self, input: Tensor_) -> dict:
+    #     try:
+    #         out_shape = [input.size[i] for i in self.perm]
+    #     except IndexError:
+    #         # 如果维度不够，可能是上游 Reshape 失败。返回一个安全的 dummy
+    #         # print(f"[Warning] Transpose input rank {len(input.size)} mismatch perm {self.perm}")
+    #         out_shape = input.size
+            
+    #     output_tensor = Tensor_(*out_shape, dtype=self.dtype)
+    #     values = {"tensor": output_tensor, "parameters": None, "graph": None}
+    #     self.parameters = {"values": values}
+    #     return values
     def forward_(self, input: Tensor_) -> dict:
-        # [Fix] 增加安全检查
+        # 打印当前 Transpose 的详细信息
+        print(f"   [Debug Transpose] Input: {input.size}, Perm: {self.perm}")
+        
+        # 1. 严格检查维度匹配
+        if len(input.size) != len(self.perm):
+            # 直接抛出异常，不再掩盖错误
+            raise ValueError(
+                f"❌ Transpose Error: Input rank {len(input.size)} ({input.size}) "
+                f"does not match perm length {len(self.perm)} ({self.perm})"
+            )
+            
+        # 2. 计算输出形状
         try:
             out_shape = [input.size[i] for i in self.perm]
-        except IndexError:
-            # 如果维度不够，可能是上游 Reshape 失败。返回一个安全的 dummy
-            # print(f"[Warning] Transpose input rank {len(input.size)} mismatch perm {self.perm}")
-            out_shape = input.size
-            
+        except IndexError as e:
+            raise IndexError(f"❌ Transpose Index Error: Perm {self.perm} is out of bounds for input {input.size}") from e
+
         output_tensor = Tensor_(*out_shape, dtype=self.dtype)
         values = {"tensor": output_tensor, "parameters": None, "graph": None}
         self.parameters = {"values": values}
