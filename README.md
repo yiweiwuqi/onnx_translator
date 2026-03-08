@@ -19,21 +19,20 @@ make
 
 在项目根目录运行：
 ```bash
-nvcc cuda/verify_relu.cu -o cache/verify_relu
-nvcc cuda/verify_abs.cu -o cache/verify_abs
-nvcc cuda/verify_add.cu -o cache/verify_add
-nvcc cuda/verify_sub.cu -o cache/verify_sub
-nvcc cuda/verify_mul.cu -o cache/verify_mul
-nvcc cuda/verify_div.cu -o cache/verify_div
-nvcc cuda/verify_cos.cu -o cache/verify_cos
+bash compile_cuda.sh     
 ```
 
 ### 4. 步骤三：生成 ONNX 测试模型
 
-此步骤运行 `create_model.py` 脚本，使用 PyTorch 导出一个包含所有算子的测试模型。
+此步骤运行 `create_model.py` 脚本，使用 PyTorch 导出一个包含算子的测试模型。
 
 ```bash
 python create_model.py
+```
+或
+
+```bash
+python create_graph_ops_model.py
 ```
 
 ### 5. 步骤四：运行图逻辑验证
@@ -50,3 +49,10 @@ python graph_logic.py
 ```bash
 python numerical_correctness.py
 ```
+
+### 6. 步骤六：验证指定模型的解析和图构建
+
+```bash
+python verify_graph.py
+```
+在脚本中可以更换要测试的模型
