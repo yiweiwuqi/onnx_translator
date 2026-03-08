@@ -6,9 +6,7 @@ import os
 
 class FinalSupportedModel(nn.Module):
     """
-    最终测试模型。
-    ✅ 保留: Conv, BN, LN, IN, AvgPool, LeakyReLU, 数学运算, 形状变换
-    ❌ 移除: Trilu (库不支持), GroupNorm (Opset 17 分解导致形状推断异常)
+    测试模型。
     """
     def __init__(self):
         super(FinalSupportedModel, self).__init__()
