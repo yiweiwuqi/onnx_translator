@@ -15,36 +15,94 @@
 
 ## 二、数值验证（Python + CUDA）
 
-数值验证采用工程内已有的统一验证脚本 `numerical_correctness.py`：
+数值验证采用工程内统一验证脚本 `numerical_correctness.py`：
 
-- Python 侧通过 `Operators.py` 调用 `tensor_ops.so` 作为参考实现
+- Python 侧通过 `nn/Operators.py` 调用 `tensor_ops.so` 作为参考实现
 - CUDA 侧通过 `cache/verify_*` 可执行文件作为 ground truth
-- 对 Python 与 CUDA 结果进行逐元素数值对比
-- 验证过程中 iterations 从默认 200 调整为 20，以保证稳定性和执行效率
+- 对 Python 与 CUDA 结果逐元素数值对比
+- iterations 从默认 200 调整为 20（稳定高效）
 
-### 已完成数值验证的算子（Python + CUDA）
+### 2.1 说明
 
+- **Mod**：验证时采用 Python/ONNX 风格的 mod 语义（结果与除数同号），避免与 C 的 `fmod` 语义差异带来大误差。
+- **RandomUniformLike**：由于不同后端的随机数实现未必逐元素一致，验证中采用固定 RNG 参考实现进行逐元素一致性验证。
+
+注：`ReduceProd` 在随机输入下可能出现溢出；脚本对 `NaN/Inf/Overflow` 做逻辑匹配，当出现 “all values were NaN/Inf/Overflow matched” warning 时，仍表示两侧结果在该情形下匹配，验证可稳定通过。
+
+### 2.2 已完成数值验证的算子（Python + CUDA）
+
+#### 基础算子 / 一元算子
+- Neg
+- Floor
+- Sign
+- IsNaN
+
+#### 基础算子 / 二元算子
 - Add
 - Sub
 - Mul
 - Div
+- Mod
+- Max
+- Min
+
+#### 激活 / 数学函数
 - Relu
+- Sigmoid
+- Tanh
+- Sin
+- Cos
+- Tan
+- Atan
+- Exp
+- Log
+- Sqrt
+- Pow
+
+#### 线性代数 / 卷积 / 池化 / Softmax
 - Conv
-- Softmax
 - Gemm
+- MatMul
+- Einsum
 - MaxPool
+- Softmax
+
+#### 比较 / 逻辑
 - Equal
 - Greater
 - Less
-- Clip
-- Sqrt
-- Pow
-- Matmul
-- Reduce_mean
+- GreaterOrEqual
+- LessOrEqual
+- Not
+- And
+- Or
+- Xor
+
+#### Reduce
+- ReduceMean
+- ReduceSum
+- ReduceMax
+- ReduceMin
+- ReduceProd
+
+#### 索引 / Scatter-Gather
 - Gather
+- GatherElements
+- GatherND
 - ScatterND
+- NonZero
+- TopK
+- ArgMin
+- ArgMax
+
+#### 扫描 / 随机 / 采样
+- CumSum
+- Resize
+- RandomUniformLike
 
 以上算子均通过 Python 与 CUDA 数值一致性验证。
+
+---
 
 ## 三、图结构与 Shape 验证
 

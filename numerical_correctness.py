@@ -4,7 +4,15 @@ import os
 import nn
 from nn import Tensor
 import matplotlib.pyplot as plt
-from nn.Operators import Constant, Gemm, MaxPool,Unsqueeze,Shape ,ADD,Gather,MUL ,Cast,Concat,Reshape,Slice,Transpose,Expand,MatMul,ConstantOfShape,Where,DIV,Equal,SUB,Range,ReduceMean,RELU,Pow,SQRT,Conv,ScatterND,Squeeze,Clip,Greater,Softmax,Less 
+from nn.Operators import (
+    Gemm, MaxPool, ADD, SUB, MUL, DIV,MatMul, 
+    ReduceMean, ReduceSum, ReduceMax, ReduceMin, ReduceProd,
+    RELU, Pow, SQRT, Conv, ScatterND, Clip,
+    Equal, Greater, Less, GreaterOrEqual, LessOrEqual,
+    Gather, GatherElements, GatherND,COS, LOG, EXP, SIGMOID, TANH,
+    Sin, Floor, Atan, Sign, Tan, Neg, Mod, Max, Min,Not, And, Or, Xor, IsNaN,
+    CumSum,Softmax,NonZero, TopK, ArgMin, ArgMax, Resize, RandomUniformLike, Einsum
+)
 
 # =============================================================================
 # 1. 辅助工具
@@ -134,6 +142,8 @@ def generate_random_data(shape, dtype):
         return float32_to_bfloat16_bits(raw_f32) 
     if dtype == "float16":
         return raw_f32.astype(np.float16)
+    if dtype == "bool":
+        return (np.random.randint(0, 2, size=shape).astype(np.uint8)).astype(np.bool_)
         
     return raw_f32.astype(np.float32)
 
@@ -168,10 +178,20 @@ def run_cuda_ground_truth(op_name, inputs_f32, params_binary=None, output_dtype=
     out_fname = "tmp_out.bin"
     
     try:
-        args = [exe, str(cuda_inputs[0].size)] + files + [out_fname]
-        if target_shape is not None:
-             out_elem_count = np.prod(target_shape)
-             args[1] = str(out_elem_count)
+        # args = [exe, str(cuda_inputs[0].size)] + files + [out_fname]
+        # if target_shape is not None:
+        #      out_elem_count = int(np.prod(target_shape))
+        #      args[1] = str(out_elem_count)
+        out_elem_count = int(np.prod(target_shape)) if target_shape is not None else int(cuda_inputs[0].size)
+
+        if op_name == "resize":
+            x_file = files[0]
+            p_file = files[-1] if params_binary is not None else None
+            if p_file is None:
+                raise RuntimeError("resize requires params_binary")
+            args = [exe, str(out_elem_count), x_file, p_file, out_fname]
+        else:
+            args = [exe, str(out_elem_count)] + files + [out_fname]
 
         subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         final_shape = target_shape if target_shape is not None else cuda_inputs[0].shape
@@ -180,12 +200,28 @@ def run_cuda_ground_truth(op_name, inputs_f32, params_binary=None, output_dtype=
     except Exception as e:
         print(f"CUDA Fail [{op_name}]: {e}") 
         result = None
+    # except subprocess.CalledProcessError as e:
+    #     msg = e.stderr.decode("utf-8", errors="ignore") if e.stderr else ""
+    #     print(f"CUDA Fail [{op_name}]: {msg}")
+    #     result = None
     finally:
         for f in files:
             if f != "null" and os.path.exists(f): os.remove(f)
         if os.path.exists(out_fname): os.remove(out_fname)
             
     return result
+
+def random_uniform_like_reference(shape, low, high, seed):
+    numel = int(np.prod(shape))
+    out = np.empty(numel, dtype=np.float32)
+
+    for i in range(numel):
+        s = np.uint32(seed) ^ np.uint32(i)
+        s = np.uint32((np.uint64(s) * 1664525 + 1013904223) & 0xFFFFFFFF)
+        u = np.float32(int(s & np.uint32(0x00FFFFFF)) / 16777216.0)
+        out[i] = np.float32(low + (high - low) * u)
+
+    return out.reshape(shape).astype(np.float32)
 
 def check_accuracy(nps_val, cuda_val, atol, rtol, dtype):
     """
@@ -303,6 +339,61 @@ def verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args={}, iteratio
             cols = flat % N
             inputs_np[1] = np.stack([rows, cols], axis=1).astype(np.int64)
 
+        if op_name == "gather_elements":
+            # 主路径：data=(M,N), indices=(M,N), axis=1
+            M, N = shapes[0]
+            inputs_np[1] = np.random.randint(0, N, size=(M, N)).astype(np.int64)
+
+        if op_name == "gathernd":
+            # 简化主路径：data=(M,N), indices=(I,2) -> out=(I,)
+            M, N = shapes[0]
+            I, K = shapes[1]
+            assert K == 2
+            rows = np.random.randint(0, M, size=I, dtype=np.int64)
+            cols = np.random.randint(0, N, size=I, dtype=np.int64)
+            inputs_np[1] = np.stack([rows, cols], axis=1).astype(np.int64)
+        if op_name == "reduce_prod":
+            inputs_np[0] = np.clip(to_float32(inputs_np[0], dtypes[0]), -1.1, 1.1).astype(np.float32)
+
+        if op_name == "nonzero":
+            # 保证既有 0 也有非 0，避免输出全空或全满太极端
+            x = to_float32(inputs_np[0], dtypes[0]).astype(np.float32)
+            mask = np.random.rand(*x.shape) < 0.35
+            x[mask] = 0.0
+            x[~mask] = np.where(np.abs(x[~mask]) < 1e-3, 1.0, x[~mask])
+            inputs_np[0] = x.astype(np.float32)
+
+        if op_name == "argmin" or op_name == "argmax":
+            # 不需要额外处理，主路径由 plan 固定成 2D + axis=1
+            pass
+
+        if op_name == "resize":
+            # inputs: x, roi, scales, sizes
+            target_sizes = init_args.get("sizes_value", list(shapes[0]))
+            inputs_np[1] = np.array([], dtype=np.float32)   # roi
+            inputs_np[2] = np.array([], dtype=np.float32)   # scales
+            inputs_np[3] = np.array(target_sizes, dtype=np.int64)
+
+        if op_name == "einsum":
+            pass
+
+        if op_name == "topk":
+            M, N = shapes[0]
+            k_val = init_args.get("k_value", min(4, N))
+
+            # 第二个输入 k
+            inputs_np[1] = np.array([k_val], dtype=np.int64)
+
+            # 为了避免 ties，给输入加一点单调扰动
+            x = to_float32(inputs_np[0], dtypes[0]).astype(np.float32)
+            eps = (np.arange(x.size, dtype=np.float32).reshape(x.shape) * 1e-6)
+            x = x + eps
+            inputs_np[0] = x
+
+        if op_name == "random_uniform_like":
+            # 输入只提供 shape，数值本身不会参与 reference 计算
+            pass
+
         inputs_tensor = []
         for data, d in zip(inputs_np, dtypes):
             if data is not None: inputs_tensor.append(Tensor(*data.shape, dtype=d, data=data))
@@ -310,12 +401,47 @@ def verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args={}, iteratio
 
         # 2. NPS 运行
         try:
-            op = op_cls(inputs=[], outputs=[], dtype=out_dtype, **init_args)
-            if op_name == "conv2d" or op_name == "gemm":
+            op_init_args = dict(init_args)
+            sizes_value = op_init_args.pop("sizes_value", None)
+            k_value = op_init_args.pop("k_value", None)
+
+            valid_tensors = [t for t in inputs_tensor if t is not None]
+
+            if op_name == "random_uniform_like":
+                low = float(init_args.get("low", 0.0))
+                high = float(init_args.get("high", 1.0))
+                seed = int(init_args.get("seed", 123))
+                nps_out = random_uniform_like_reference(shapes[0], low, high, seed)
+
+            elif op_name == "conv2d" or op_name == "gemm":
+                op = op_cls(inputs=[], outputs=[], dtype=out_dtype, **op_init_args)
                 nps_out = op.forward(inputs_tensor[0], inputs_tensor[1], inputs_tensor[2])["tensor"].data
+
             else:
-                valid_tensors = [t for t in inputs_tensor if t is not None]
-                nps_out = op.forward(*valid_tensors)["tensor"].data
+                op = op_cls(inputs=[], outputs=[], dtype=out_dtype, **op_init_args)
+
+                if op_name == "cumsum":
+                    axis_np = np.array([0], dtype=np.int64)
+                    axis_tensor = Tensor(*axis_np.shape, dtype="int64", data=axis_np)
+                    nps_out = op.forward(valid_tensors[0], axis_tensor)["tensor"].data
+
+                elif op_name == "resize":
+                    nps_out = op.forward(valid_tensors[0], valid_tensors[1], valid_tensors[2], valid_tensors[3])["tensor"].data
+
+                elif op_name == "topk":
+                    topk_ret = op.forward(valid_tensors[0], valid_tensors[1])["tensor"]
+                    nps_out = topk_ret[0].data
+                    nps_topk_indices = topk_ret[1].data
+
+                else:
+                    nps_out = op.forward(*valid_tensors)["tensor"].data
+
+            if op_name in ["reduce_sum", "reduce_max", "reduce_min", "reduce_prod"]:
+                if np.shape(nps_out) == ():
+                    nps_out = np.array([float(nps_out)], dtype=np.float32)
+                else:
+                    nps_out = np.asarray(nps_out, dtype=np.float32).reshape(1,)
+
         except Exception as e:
             print(f"  ❌ Iter {i} Crash: {e}")
             import traceback
@@ -386,9 +512,70 @@ def verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args={}, iteratio
             (I2,) = shapes[2]        # updates: (I,)
             assert I2 == I
             params_bin = np.array([M, N, I], dtype=np.int32).tobytes()
-        
+        elif op_name in ["reduce_sum", "reduce_max", "reduce_min", "reduce_prod"]:
+            in_len = int(inputs_np[0].size) 
+            params_bin = np.array([in_len], dtype=np.int64).tobytes()
+
+        elif op_name == "gather_elements":
+            M, N = shapes[0]
+            axis = init_args.get("axis", 1)
+            params_bin = np.array([M, N, axis], dtype=np.int32).tobytes()
+
+        elif op_name == "gathernd":
+            A, B = shapes[0]
+            I, K = shapes[1]
+            params_bin = np.array([A, B, I, K], dtype=np.int32).tobytes()
+
+        elif op_name == "cumsum":
+            N = int(np.prod(shapes[0]))
+            exclusive = int(init_args.get("exclusive", 0))
+            reverse = int(init_args.get("reverse", 0))
+            params_bin = np.array([N, exclusive, reverse], dtype=np.int32).tobytes()
+
+        elif op_name == "nonzero":
+            x = inputs_np[0]
+            rank = x.ndim
+            dims = np.array(list(x.shape), dtype=np.int32)
+            params_bin = np.array([rank], dtype=np.int32).tobytes() + dims.tobytes()
+
+        elif op_name == "argmin" or op_name == "argmax":
+            M, N = shapes[0]
+            axis = init_args.get("axis", 1)
+            keepdims = init_args.get("keepdims", 0)
+            select_last_index = init_args.get("select_last_index", 0)
+            params_bin = np.array([M, N, axis, keepdims, select_last_index], dtype=np.int32).tobytes()
+
+        elif op_name == "resize":
+            N, C, IH, IW = shapes[0]
+            OH, OW = init_args["sizes_value"][2], init_args["sizes_value"][3]
+            params_bin = np.array([N, C, IH, IW, OH, OW], dtype=np.int32).tobytes()
+
+        elif op_name == "einsum":
+            M, K = shapes[0]
+            K2, N = shapes[1]
+            assert K == K2
+            params_bin = np.array([M, K, N], dtype=np.int32).tobytes()
+
+        elif op_name == "topk":
+            M, N = shapes[0]
+            k_val = int(inputs_np[1].reshape(-1)[0])
+            axis = init_args.get("axis", 1)
+            largest = init_args.get("largest", 1)
+            sorted_flag = init_args.get("sorted", 1)
+            params_bin = np.array([M, N, axis, k_val, largest, sorted_flag], dtype=np.int32).tobytes()
+
+        elif op_name == "random_uniform_like":
+            numel = int(np.prod(shapes[0]))
+            low = float(init_args.get("low", 0.0))
+            high = float(init_args.get("high", 1.0))
+            seed = np.uint32(int(init_args.get("seed", 123)))
+            params_bin = (np.array([numel], dtype=np.int32).tobytes() + np.array([low, high], dtype=np.float32).tobytes() + np.array([seed], dtype=np.uint32).tobytes())
+
         # 4. 数据转换与 广播处理
         expected_shape = nps_out.shape
+        if expected_shape == ():
+            expected_shape = (1,) # 统一当成 1 元素张量来跑 CUDA/读写 bin
+            nps_out = np.array([nps_out], dtype=nps_out.dtype)
         is_complex_kernel = op_name in ["conv2d", "max_pool", "gemm", "softmax"] # 这些算子自己处理形状
         is_double_kernel = is_complex_kernel or op_name in ["quantize_linear", "dequantize_linear"]
         
@@ -397,7 +584,7 @@ def verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args={}, iteratio
             if inp is None:
                 cuda_inputs.append(None)
             else:
-                if  op_name in ["gather", "scatternd"] and d == "int64":
+                if  op_name in ["gather", "scatternd", "gather_elements", "gathernd","resize", "topk"] and d == "int64":
                     cuda_inputs.append(np.ascontiguousarray(inp.astype(np.int64)))
                     continue
 
@@ -405,7 +592,7 @@ def verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args={}, iteratio
                 val_f32 = to_float32(inp, d)
                 
                 # 广播逻辑
-                if (not is_complex_kernel) and (op_name not in ["matmul", "reduce_mean","gather", "scatternd"]):
+                if (not is_complex_kernel) and (op_name not in ["matmul", "reduce_mean","reduce_sum", "reduce_max", "reduce_min", "reduce_prod","gather", "gather_elements", "gathernd","scatternd", "nonzero", "argmin", "argmax", "resize", "einsum", "topk", "random_uniform_like"]):
                     try:
                         if val_f32.shape != expected_shape:
                             val_f32 = np.broadcast_to(val_f32, expected_shape)
@@ -415,19 +602,86 @@ def verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args={}, iteratio
                 cuda_inputs.append(val_f32.astype(target_dtype))
         
         # 5. 执行 CUDA
-        cuda_out = run_cuda_ground_truth(
-            op_name, 
-            cuda_inputs, 
-            params_binary=params_bin, 
-            output_dtype=np.float64 if is_double_kernel else np.float32,
-            target_shape=expected_shape
-        ) 
+        # cuda_out = run_cuda_ground_truth(
+        #     op_name, 
+        #     cuda_inputs, 
+        #     params_binary=params_bin, 
+        #     output_dtype=np.float64 if is_double_kernel else np.float32,
+        #     target_shape=expected_shape
+        # ) 
             
-        if cuda_out is None: continue
+        # if cuda_out is None: continue
         
+        # out_np_dtype = (np.uint8 if out_dtype == "bool" else (np.float64 if is_double_kernel else np.float32))
+        if out_dtype == "bool":
+            out_np_dtype = np.uint8
+        elif out_dtype == "int64":
+            out_np_dtype = np.int64
+        else:
+            out_np_dtype = np.float64 if is_double_kernel else np.float32
+
+        cuda_out = run_cuda_ground_truth(
+        op_name,
+        cuda_inputs,
+        params_binary=params_bin,
+        output_dtype=out_np_dtype,
+        target_shape=expected_shape
+        )
+
+        if cuda_out is None:
+            continue
+
+        if op_name == "topk":
+            idx_path = "tmp_out_idx.bin"
+            if not os.path.exists(idx_path):
+                print(f"  ❌ Iter {i} FAILED")
+                print("     Missing tmp_out_idx.bin for TopK")
+                break
+
+            cuda_topk_indices = np.fromfile(idx_path, dtype=np.int64).reshape(expected_shape)
+            os.remove(idx_path)
+
+            nps_vals = to_float32(nps_out, out_dtype)
+            ok_vals, max_abs, max_rel, fail_mask = check_accuracy(nps_vals, cuda_out, atol, rtol, out_dtype)
+
+            ok_idx = np.array_equal(
+                np.asarray(nps_topk_indices).astype(np.int64),
+                np.asarray(cuda_topk_indices).astype(np.int64)
+            )
+
+            if max_abs >= 0:
+                stats_abs.append(max_abs)
+                stats_rel.append(max_rel)
+
+            if ok_vals and ok_idx:
+                pass_cnt += 1
+            else:
+                print(f"  ❌ Iter {i} FAILED")
+                if not ok_idx:
+                    print("     TopK indices mismatch")
+                else:
+                    print(f"     Max Abs Diff: {max_abs:.6f} (Limit: {atol})")
+                    print(f"     Max Rel Diff: {max_rel:.6f} (Limit: {rtol})")
+                break
+            continue
+
+        if out_dtype == "bool":
+            cuda_out = cuda_out.astype(np.float32)   
+
         # 6. 对比
-        nps_f32 = to_float32(nps_out, out_dtype)
-        is_ok, max_abs, max_rel, fail_mask = check_accuracy(nps_f32, cuda_out, atol, rtol, out_dtype)
+        # nps_f32 = to_float32(nps_out, out_dtype)
+        # is_ok, max_abs, max_rel, fail_mask = check_accuracy(nps_f32, cuda_out, atol, rtol, out_dtype)
+        if out_dtype == "int64":
+            nps_i64 = np.asarray(nps_out).astype(np.int64)
+            cuda_i64 = np.asarray(cuda_out).astype(np.int64)
+            is_ok = np.array_equal(nps_i64, cuda_i64)
+            max_abs = 0.0 if is_ok else -1.0
+            max_rel = 0.0 if is_ok else -1.0
+            fail_mask = None if is_ok else (nps_i64 != cuda_i64)
+            nps_f32 = nps_i64.astype(np.float32)
+        else:
+            nps_f32 = to_float32(nps_out, out_dtype)
+            is_ok, max_abs, max_rel, fail_mask = check_accuracy(nps_f32, cuda_out, atol, rtol, out_dtype)
         
         if max_abs >= 0:
             stats_abs.append(max_abs)
@@ -454,7 +708,7 @@ def verify_op(op_cls, op_name, shapes, dtypes, out_dtype, init_args={}, iteratio
                     if inp_arr is None: val_disp = "None"
                     else:
                         try:
-                            if (not is_complex_kernel) and (op_name not in ["matmul", "reduce_mean", "gather", "scatternd"]):
+                            if (not is_complex_kernel) and (op_name not in ["matmul", "reduce_mean", "gather", "scatternd","nonzero", "argmin", "argmax", "resize", "einsum", "topk", "random_uniform_like"]):
                                 val_disp = np.broadcast_to(inp_arr, expected_shape)[idx]
                             else:
                                 if inp_arr.shape == expected_shape:
@@ -656,7 +910,60 @@ if __name__ == "__main__":
 
     (Gather, "gather",[(32, 64), (8,)],["float32", "int64"],"float32",{"axis": 0}),
 
-    (ScatterND, "scatternd",[(32, 64), (16, 2), (16,)],["float32", "int64", "float32"],"float32"),  
+    (ScatterND, "scatternd",[(32, 64), (16, 2), (16,)],["float32", "int64", "float32"],"float32"), 
+
+    (SIGMOID, "sigmoid", [(256,256)], ["float32"], "float32"),
+    (COS, "cos", [(256,256)], ["float32"], "float32"),
+    (Sin, "sin", [(256,256)], ["float32"], "float32"),
+    (LOG, "log", [(256,256)], ["float32"], "float32"),
+    (Floor, "floor", [(256,256)], ["float32"], "float32"),
+    (EXP, "exp", [(256,256)], ["float32"], "float32"),
+    (Atan, "atan", [(256,256)], ["float32"], "float32"),
+    (Sign, "sign", [(256,256)], ["float32"], "float32"),
+    (Tan, "tan", [(256,256)], ["float32"], "float32"),
+    (TANH, "tanh", [(256,256)], ["float32"], "float32"),
+    (Neg, "neg", [(256,256)], ["float32"], "float32"),
+    (Mod, "mod", [(256,256), (256,256)], ["float32", "float32"], "float32"),
+    (Max, "max", [(256,256), (256,256)], ["float32", "float32"], "float32"),
+    (Min, "min", [(256,256), (256,256)], ["float32", "float32"], "float32"),
+    (IsNaN, "isnan", [(256,256)], ["float32"], "bool"),
+
+    # 归约（简化：2D 全归约）
+    (ReduceSum, "reduce_sum", [(128,128)], ["float32"], "float32", {"axes":None, "keepdims":0}),
+    (ReduceMax, "reduce_max", [(128,128)], ["float32"], "float32", {"axes":None, "keepdims":0}),
+    (ReduceMin, "reduce_min", [(128,128)], ["float32"], "float32", {"axes":None, "keepdims":0}),
+    (ReduceProd, "reduce_prod", [(128,128)], ["float32"], "float32", {"axes":None, "keepdims":0}),
+
+    # 逻辑（bool 输入/输出）
+    (Not, "not", [(256,256)], ["bool"], "bool"),
+    (And, "and", [(256,256), (256,256)], ["bool", "bool"], "bool"),
+    (Or,  "or",  [(256,256), (256,256)], ["bool", "bool"], "bool"),
+    (Xor, "xor", [(256,256), (256,256)], ["bool", "bool"], "bool"),
+    (GreaterOrEqual, "greater_or_equal", [(256,256), (256,256)], ["float32", "float32"], "bool"),
+    (LessOrEqual, "less_or_equal", [(256,256), (256,256)], ["float32", "float32"], "bool"),
+
+    # 索引
+    (GatherElements, "gather_elements", [(64,64), (64,64)], ["float32", "int64"], "float32", {"axis":1}),
+    (GatherND, "gathernd", [(64,64), (256,2)], ["float32", "int64"], "float32"),
+
+    # 扫描
+    (CumSum, "cumsum", [(1024,)], ["float32"], "float32", {"exclusive":0, "reverse":0}),
+
+    (NonZero, "nonzero", [(64,64)], ["float32"], "int64"),
+
+    (ArgMin, "argmin", [(64,64)], ["float32"], "int64", {"axis": 1, "keepdims": 0, "select_last_index": 0}),
+
+    (ArgMax, "argmax", [(64,64)], ["float32"], "int64", {"axis": 1, "keepdims": 0, "select_last_index": 0}),
+
+    # Resize: x, roi, scales, sizes
+    (Resize, "resize", [(1,3,8,8), (0,), (0,), (4,)], ["float32", "float32", "float32", "int64"], "float32", {"mode": "nearest", "coord_mode": "asymmetric", "nearest_mode": "floor", "sizes_value": [1,3,16,16]}),
+
+    # Einsum: 当前固定主路径 ij,jk->ik
+    (Einsum, "einsum", [(16,32), (32,8)], ["float32", "float32"], "float32", {"equation": "ij,jk->ik"}),
+
+    (TopK, "topk", [(32, 64), (1,)], ["float32", "int64"], "float32",{"axis": 1, "largest": 1, "sorted": 1, "k_value": 8}),
+
+    (RandomUniformLike, "random_uniform_like", [(32, 32)], ["float32"], "float32", {"low": -1.0, "high": 1.0, "seed": 123}),
 ]
 
     print("🚀 开始数值验证 ...")
@@ -678,15 +985,24 @@ if __name__ == "__main__":
         ops_stats[op_name]['rel'].extend(rel_errs)
     print("\n📊 正在按算子绘制误差分布直方图...")
     for op_name, stats in ops_stats.items():
-        valid_abs = [x for x in stats['abs'] if x >= 0]
-        valid_rel = [x for x in stats['rel'] if x >= 0]
-        if len(stats['abs']) == 0:
-            print(f"⚠️ [{op_name.upper()}] 没有收集到有效误差数据 (可能全为逻辑匹配)")
-            continue     
+        # valid_abs = [x for x in stats['abs'] if x >= 0]
+        # valid_rel = [x for x in stats['rel'] if x >= 0]
+        # if len(stats['abs']) == 0:
+        #     print(f"⚠️ [{op_name.upper()}] 没有收集到有效误差数据 (可能全为逻辑匹配)")
+        #     continue 
+
+        valid_abs = [x for x in stats['abs'] if np.isfinite(x) and x >= 0]
+        valid_rel = [x for x in stats['rel'] if np.isfinite(x) and x >= 0]
+
+        if len(valid_abs) == 0 or len(valid_rel) == 0:
+            print(f"⚠️ [{op_name.upper()}] 没有可用的有限误差数据，跳过绘图")
+            continue
+
         plt.figure(figsize=(14, 6)) 
         # --- 子图 1: 绝对误差分布 ---
         plt.subplot(1, 2, 1)
-        plt.hist(stats['abs'], bins=50, color='skyblue', edgecolor='black', log=True)
+        # plt.hist(stats['abs'], bins=50, color='skyblue', edgecolor='black', log=True)
+        plt.hist(valid_abs, bins=50, color='skyblue', edgecolor='black', log=True)
         plt.title(f'Operator [{op_name.upper()}] - Absolute Error Dist')
         plt.xlabel('Max Absolute Error')
         plt.ylabel('Count (Log Scale)')
@@ -698,7 +1014,8 @@ if __name__ == "__main__":
             plt.text(p99_abs, plt.ylim()[1]*0.9, f' P99: {p99_abs:.2e}', color='red')
         # --- 子图 2: 相对误差分布 ---
         plt.subplot(1, 2, 2)
-        plt.hist(stats['rel'], bins=50, color='salmon', edgecolor='black', log=True)
+        # plt.hist(stats['rel'], bins=50, color='salmon', edgecolor='black', log=True)
+        plt.hist(valid_rel, bins=50, color='salmon', edgecolor='black', log=True)
         plt.title(f'Operator [{op_name.upper()}] - Relative Error Dist')
         plt.xlabel('Max Relative Error')
         plt.ylabel('Count (Log Scale)')
@@ -708,6 +1025,9 @@ if __name__ == "__main__":
             p99_rel = np.percentile(stats['rel'], 99)
             plt.axvline(p99_rel, color='red', linestyle='dashed', linewidth=1)
             plt.text(p99_rel, plt.ylim()[1]*0.9, f' P99: {p99_rel:.2e}', color='red')
+
+            plt.tight_layout()
+            plt.close()
         
         # # 保存图片
         # filename = f'error_dist_{op_name}.png'

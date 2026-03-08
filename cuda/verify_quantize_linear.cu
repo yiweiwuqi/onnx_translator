@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
+// 升级: 所有指针和计算改为 double
 __device__ double saturate_cast_int8(double val) {
     if (val > 127.0) return 127.0;
     if (val < -128.0) return -128.0;

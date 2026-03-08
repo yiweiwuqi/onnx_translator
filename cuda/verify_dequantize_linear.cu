@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <cuda_runtime.h>
 
-// 升级: 所有指针和计算改为 double
 __global__ void dequantize_kernel(const double* x, const double* scale, const double* zp, double* out, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
