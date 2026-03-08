@@ -485,7 +485,6 @@ class Graph:
     def forward_(self, *inputs):
         """
         执行前向传播计算（不使用真实数据，用于图构建）
-        [已修复] 支持 ONNX 可选输入（空字符串处理）
         """
         # 初始化边数据缓冲区
         edge_data_buffer = {}
@@ -501,16 +500,12 @@ class Graph:
         for (cc, op_na) in zip(range(length), self.ops):
             op = self.ops[op_na]
             
-            # --- [核心修复] 处理 ONNX 可选输入 ---
             op_inputs_list = []
             try:
                 for na in op.inputs:
                     if na == "":
-                        # 如果输入名为空字符串，说明是 ONNX 的可选输入且未提供
-                        # 此时传递 None 给算子
                         op_inputs_list.append(None)
                     else:
-                        # 正常查找输入张量
                         if na not in edge_data_buffer:
                             raise KeyError(f"找不到输入边: '{na}'")
                         op_inputs_list.append(edge_data_buffer[na])
@@ -518,8 +513,8 @@ class Graph:
                 op_inputs = tuple(op_inputs_list)
                 
             except KeyError as e:
-                print(f"\n❌ [图构建错误] 算子 {op_na} ({op.__class__.__name__}) 输入缺失: {e}")
-                print(f"   该算子需要的输入: {op.inputs}")
+                #print(f"\n [图构建错误] 算子 {op_na} ({op.__class__.__name__}) 输入缺失: {e}")
+                #print(f"   该算子需要的输入: {op.inputs}")
                 # print(f"   当前缓冲区可用边: {list(edge_data_buffer.keys())}") # 调试时可开启
                 raise e
 
@@ -527,10 +522,9 @@ class Graph:
             try:
                 outputs = op.forward_(*op_inputs)
             except Exception as e:
-                print(f"\n❌ [算子推断崩溃] 在执行 {op_na} ({op.__class__.__name__}) 时发生错误！")
-                print(f"   错误信息: {e}")
+                #print(f"\n [算子推断崩溃] 在执行 {op_na} ({op.__class__.__name__}) 时发生错误！")
+                #print(f"   错误信息: {e}")
                 
-                # 尝试打印输入形状信息
                 input_info = []
                 for x in op_inputs:
                     if x is None: input_info.append("None")
@@ -583,137 +577,4 @@ class Graph:
             # 清理无用的边数据
             for na in list(edge_data_buffer.keys()):
                 if na in self.output_in_degree and self.output_in_degree[na] == 0:
-                    edge_data_buffer.pop(na)
-                    
-    # def forward_(self, *inputs):
-    #     """
-    #     执行前向传播计算（不使用真实数据，用于图构建）
-    #     [已修改] 增加了详细的调试信息和错误捕获
-    #     """
-    #     # 初始化边数据缓冲区
-    #     edge_data_buffer = {}
-    #     outputs = ()
-        
-    #     # 设置输入数据
-    #     for idx, na in enumerate(self.input_name):
-    #         edge_data_buffer[na] = inputs[idx]
-            
-    #     length = len(self.ops)
-        
-    #     # 依次执行每个操作
-    #     for (cc, op_na) in zip(range(length), self.ops):
-    #         op = self.ops[op_na]
-            
-    #         # --- [修改点 1] 安全获取输入，并转为列表以便调试 ---
-    #         try:
-    #             # 将生成器转为 tuple，防止一次性消费后无法打印
-    #             op_inputs = tuple([edge_data_buffer[na] for na in op.inputs])
-    #         except KeyError as e:
-    #             print(f"\n❌ [图构建错误] 算子 {op_na} ({op.__class__.__name__}) 找不到输入: {e}")
-    #             print(f"   当前可用边: {list(edge_data_buffer.keys())}")
-    #             raise e
-
-    #         # --- [修改点 2] 增加执行前的 Debug 打印 (可选注释掉) ---
-    #         # print(f"DEBUG: 正在推断 {op_na} ({op.__class__.__name__})...")
-
-    #         # --- [修改点 3] 捕获算子内部错误 ---
-    #         try:
-    #             outputs = op.forward_(*op_inputs)
-    #         except Exception as e:
-    #             print(f"\n❌ [算子推断崩溃] 在执行 {op_na} ({op.__class__.__name__}) 时发生错误！")
-    #             print(f"   错误信息: {e}")
-    #             # 尝试打印输入形状
-    #             input_shapes = []
-    #             for x in op_inputs:
-    #                 if hasattr(x, 'size'): input_shapes.append(x.size)
-    #                 else: input_shapes.append(str(x))
-    #             print(f"   输入形状: {input_shapes}")
-    #             print(f"   算子参数: {op.__dict__}")
-    #             raise e # 再次抛出，中断程序
-            
-    #         # 处理输出结果
-    #         if isinstance(outputs, dict):
-    #             if "graph" in outputs:
-    #                 outputs, graph = outputs["tensor"], outputs["graph"]
-    #                 do_graph = True
-    #             elif "parameters" in outputs:
-    #                 outputs, parameters = outputs["tensor"], outputs["parameters"]
-    #                 do_graph = False
-            
-    #         # 更新入度
-    #         for idx, inp_na in enumerate(op.inputs):
-    #             if inp_na in self.output_in_degree:
-    #                 self.output_in_degree[inp_na] -= 1
-                
-    #         # --- [修改点 4] 安全分配输出 ---
-    #         try:
-    #             for idx, out_na in enumerate(op.outputs):
-    #                 if len(op.outputs) == 1:
-    #                     edge_data_buffer[out_na] = outputs
-    #                     continue
-                    
-    #                 # 检查 outputs 是否为列表/元组且长度足够
-    #                 if not isinstance(outputs, (list, tuple)):
-    #                     raise TypeError(f"算子有多输出，但 forward_ 返回了非列表类型: {type(outputs)}")
-    #                 if idx >= len(outputs):
-    #                     raise IndexError(f"算子声明了 {len(op.outputs)} 个输出，但只返回了 {len(outputs)} 个结果")
-                        
-    #                 edge_data_buffer[out_na] = outputs[idx]
-    #         except Exception as e:
-    #             print(f"\n❌ [输出分配错误] 算子 {op_na} ({op.__class__.__name__}) 输出处理失败: {e}")
-    #             raise e
-                
-    #         # 清理无用的边数据
-    #         for na in list(edge_data_buffer.keys()):
-    #             if na in self.output_in_degree and self.output_in_degree[na] == 0:
-    #                 edge_data_buffer.pop(na)
-
-    # def forward_(self, *inputs):
-    #     """
-    #     执行前向传播计算（不使用真实数据，用于图构建）
-        
-    #     Args:
-    #         *inputs: 输入数据占位符
-            
-    #     Returns:
-    #         计算结果占位符
-    #     """
-    #     # 初始化边数据缓冲区
-    #     edge_data_buffer = {}
-    #     outputs = ()
-        
-    #     # 设置输入数据
-    #     for idx, na in enumerate(self.input_name):
-    #         edge_data_buffer[na] = inputs[idx]
-            
-    #     length = len(self.ops)
-        
-    #     # 依次执行每个操作
-    #     for (cc, op_na) in zip(range(length), self.ops):
-    #         op = self.ops[op_na]
-    #         inputs = (edge_data_buffer[na] for na in op.inputs)
-    #         outputs = op.forward_(*inputs)
-            
-    #         # 处理输出结果
-    #         if "graph" in outputs:
-    #             outputs, graph = outputs["tensor"], outputs["graph"]
-    #             do_graph = True
-    #         elif "parameters" in outputs:
-    #             outputs, parameters = outputs["tensor"], outputs["parameters"]
-    #             do_graph = False
-                
-    #         # 更新入度
-    #         for idx, inp_na in enumerate(op.inputs):
-    #             self.output_in_degree[inp_na] -= 1
-                
-    #         # 保存输出结果
-    #         for idx, out_na in enumerate(op.outputs):
-    #             if len(op.outputs) == 1:
-    #                 edge_data_buffer[out_na] = outputs
-    #                 continue
-    #             edge_data_buffer[out_na] = outputs[idx]
-                
-    #         # 清理无用的边数据
-    #         for na in list(edge_data_buffer.keys()):
-    #             if self.output_in_degree[na] == 0:
-    #                 edge_data_buffer.pop(na)
+                    edge_data_buffer.pop(na)  
