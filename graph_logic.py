@@ -20,7 +20,6 @@ if not os.path.exists(result_dir):
     os.makedirs(result_dir)
     print(f"创建目录: {result_dir}")
 
-# --- 核心流程 ---
 # 1. 导入算子
 print("步骤 1: 导入 ONNX 模型并映射算子...")
 ops_list = ONNXImport(file_path)

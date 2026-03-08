@@ -985,15 +985,15 @@ class Transpose(Ops):
         # 打印当前 Transpose 的详细信息
         print(f"   [Debug Transpose] Input: {input.size}, Perm: {self.perm}")
         
-        # 1. 严格检查维度匹配
+        # 严格检查维度匹配
         if len(input.size) != len(self.perm):
-            # 直接抛出异常，不再掩盖错误
+            # 直接抛出异常
             raise ValueError(
                 f"❌ Transpose Error: Input rank {len(input.size)} ({input.size}) "
                 f"does not match perm length {len(self.perm)} ({self.perm})"
             )
             
-        # 2. 计算输出形状
+        # 计算输出形状
         try:
             out_shape = [input.size[i] for i in self.perm]
         except IndexError as e:
@@ -2480,7 +2480,7 @@ class Resize(Ops):
         return {"tensor": Tensor(*out_shape, dtype=self.dtype, data=out_data), "parameters": None}
 
     def forward_(self, x, roi=None, scales=None, sizes=None):
-        # [Fix] 无法推断时保持原 shape，避免后续算子崩溃
+        # 无法推断时保持原 shape，避免后续算子崩溃
         return {"tensor": Tensor_(*x.size, dtype=self.dtype), "parameters": None}
     
 class TopK(Ops):
